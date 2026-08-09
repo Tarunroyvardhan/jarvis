@@ -1,0 +1,11 @@
+.env
+credentials.json
+data/google_token.json
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+data/*.db
+data/*.sqlite3
+.DS_Store
