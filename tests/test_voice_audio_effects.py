@@ -97,3 +97,30 @@ def test_cinematic_effect_combines_both_and_preserves_length():
     assert result.shape == samples.shape
     assert not np.allclose(result, samples)  # something changed
     assert np.max(np.abs(result)) <= 1.0 + 1e-9
+
+
+def test_room_sheen_adds_faint_reflections_without_clipping():
+    import numpy as np
+
+    from app.voice.audio_effects import apply_room_sheen
+
+    rate = 16000
+    impulse = np.zeros(rate // 10)
+    impulse[0] = 1.0
+    out = apply_room_sheen(impulse, rate, gain=0.12)
+    tap = int(rate * 11 / 1000)
+    assert out.shape == impulse.shape
+    assert 0 < out[tap] <= 0.12 + 1e-9  # reflection present, and faint
+    assert np.max(np.abs(out)) <= 1.0
+    assert np.array_equal(apply_room_sheen(impulse, rate, gain=0.0), impulse)
+
+
+def test_cinematic_effect_without_modulation_has_no_wobble():
+    import numpy as np
+
+    from app.voice.audio_effects import apply_cinematic_effect
+
+    rate = 16000
+    tone = np.full(rate, 0.5)  # constant signal: any wobble would show up as variance
+    out = apply_cinematic_effect(tone, rate, boost_gain_db=0.0, mod_depth=0.0)
+    assert np.std(out[rate // 2 :]) < 1e-6

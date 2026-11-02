@@ -4,7 +4,79 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from app.voice.tts import EdgeTTSProvider
+from app.voice.tts import EdgeTTSProvider, split_for_speech
+
+
+@pytest.fixture(autouse=True)
+def _file_based_path(request, monkeypatch):
+    """Most tests here cover the file-based fallback path (edge-tts save ->
+    pygame). Tests marked `streaming` exercise the in-memory streaming path."""
+    if "streaming" not in request.keywords:
+        monkeypatch.setattr(EdgeTTSProvider, "_streaming_available", staticmethod(lambda: False))
+
+
+def _streaming_edge_tts(fail_on: set[str] | None = None):
+    """Fake edge_tts whose Communicate(...).stream() yields one audio chunk."""
+
+    class FakeCommunicate:
+        def __init__(self, text, *args, **kwargs):
+            self.text = text
+
+        async def stream(self):
+            if fail_on and self.text in fail_on:
+                raise RuntimeError("403, message='Invalid response status'")
+            yield {"type": "audio", "data": self.text.encode()}
+
+    module = types.ModuleType("edge_tts")
+    module.Communicate = FakeCommunicate
+    return module
+
+
+def test_split_for_speech_starts_with_a_short_first_chunk():
+    text = "Sure. I've opened Chrome for you. " + "This is a longer follow-up sentence. " * 6
+    chunks = split_for_speech(text)
+    assert chunks[0] == "Sure. I've opened Chrome for you."
+    assert all(len(c) <= 160 for c in chunks)
+    assert " ".join(chunks) == text.strip()
+
+
+@pytest.mark.streaming
+@pytest.mark.asyncio
+async def test_streaming_plays_every_chunk_in_order(monkeypatch):
+    monkeypatch.setitem(sys.modules, "edge_tts", _streaming_edge_tts())
+    tts = EdgeTTSProvider()
+    monkeypatch.setattr(tts, "_decode_and_process", lambda data: (data.decode(), 24000, True))
+    played = []
+    monkeypatch.setattr(tts, "_play_samples", lambda samples, rate: played.append(samples))
+
+    text = "First sentence here. Second sentence follows it. " + "More words in a third part. " * 8
+    result = await tts.speak(text)
+
+    assert result.success is True
+    assert played == split_for_speech(text)
+
+
+@pytest.mark.streaming
+@pytest.mark.asyncio
+async def test_streaming_falls_back_to_windows_voice_for_the_rest(monkeypatch):
+    text = "First sentence here. Second sentence follows it."
+    chunks = split_for_speech(text)
+    monkeypatch.setitem(sys.modules, "edge_tts", _streaming_edge_tts(fail_on={chunks[1]}))
+    tts = EdgeTTSProvider()
+    monkeypatch.setattr(tts, "_decode_and_process", lambda data: (data.decode(), 24000, False))
+    played, fallback = [], []
+    monkeypatch.setattr(tts, "_play_samples", lambda samples, rate: played.append(samples))
+
+    async def fake_windows(text):
+        fallback.append(text)
+        return None
+
+    monkeypatch.setattr(tts, "_speak_with_windows_voice", fake_windows)
+    result = await tts.speak(text)
+
+    assert result.success is True
+    assert played == [chunks[0]]
+    assert fallback == [chunks[1]]
 
 
 @pytest.mark.asyncio
@@ -116,10 +188,43 @@ async def test_speak_reports_synthesis_failure(monkeypatch):
     monkeypatch.setitem(sys.modules, "edge_tts", fake_edge_tts_module)
 
     tts = EdgeTTSProvider()
+
+    async def fallback_fails(text):
+        return "no offline voice"
+
+    monkeypatch.setattr(tts, "_speak_with_windows_voice", fallback_fails)
     result = await tts.speak("hello there")
 
     assert result.success is False
     assert "Speech synthesis failed" in result.error
+
+
+@pytest.mark.asyncio
+async def test_speak_falls_back_to_offline_voice(monkeypatch):
+    """Edge's online voice can reject requests (HTTP 403); Jarvis should
+    still speak via the built-in Windows voice instead of going silent."""
+    fake_communicate_instance = MagicMock()
+
+    async def failing_save(path):
+        raise RuntimeError("403, message='Invalid response status'")
+
+    fake_communicate_instance.save = failing_save
+    fake_edge_tts_module = types.ModuleType("edge_tts")
+    fake_edge_tts_module.Communicate = MagicMock(return_value=fake_communicate_instance)
+    monkeypatch.setitem(sys.modules, "edge_tts", fake_edge_tts_module)
+
+    tts = EdgeTTSProvider()
+    spoken = []
+
+    async def fallback_ok(text):
+        spoken.append(text)
+        return None
+
+    monkeypatch.setattr(tts, "_speak_with_windows_voice", fallback_ok)
+    result = await tts.speak("hello there")
+
+    assert result.success is True
+    assert spoken == ["hello there"]
 
 
 @pytest.mark.asyncio

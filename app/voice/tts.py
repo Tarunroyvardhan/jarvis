@@ -7,7 +7,11 @@ ElevenLabs, OpenAI TTS, or a local engine later without touching callers.
 
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
+import re
+import sys
 import tempfile
 import uuid
 from abc import ABC, abstractmethod
@@ -15,6 +19,37 @@ from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def clean_for_speech(text: str) -> str:
+    """Strip markdown and URLs so the voice doesn't read out asterisks,
+    hashes and long links."""
+    text = re.sub(r"```.*?```", " (code omitted) ", text, flags=re.S)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)  # [label](url) -> label
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.M)
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.M)
+    text = re.sub(r"[*_`~|>]", "", text)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def split_for_speech(text: str, first_min_chars: int = 12, max_chars: int = 160) -> list[str]:
+    """Split text into chunks to synthesize one after another. The first
+    chunk is kept short (about one sentence) so speech starts quickly; later
+    chunks are merged up to `max_chars` so there are few gaps."""
+    parts = [p.strip() for p in re.split(r"(?<=[.!?;:])\s+|\n+", text) if p.strip()]
+    chunks: list[str] = []
+    buf = ""
+    for part in parts:
+        limit = first_min_chars if not chunks else max_chars
+        if buf and (len(buf) >= limit or len(buf) + len(part) > max_chars):
+            chunks.append(buf)
+            buf = part
+        else:
+            buf = f"{buf} {part}".strip()
+    if buf:
+        chunks.append(buf)
+    return chunks
 
 
 @dataclass(frozen=True)
@@ -60,6 +95,7 @@ class EdgeTTSProvider(TextToSpeech):
         effect_boost_db: float = 1.5,
         effect_mod_hz: float = 50.0,
         effect_mod_depth: float = 0.05,
+        effect_room: float = 0.0,
     ) -> None:
         self._voice = voice
         self._rate = rate
@@ -69,9 +105,12 @@ class EdgeTTSProvider(TextToSpeech):
         self._effect_boost_db = effect_boost_db
         self._effect_mod_hz = effect_mod_hz
         self._effect_mod_depth = effect_mod_depth
+        self._effect_room = effect_room
+        self._effect_warned = False
 
     async def speak(self, text: str) -> SpeechResult:
-        if not text or not text.strip():
+        text = clean_for_speech(text or "")
+        if not text:
             return SpeechResult(success=False, error="No text to speak.")
 
         try:
@@ -79,6 +118,137 @@ class EdgeTTSProvider(TextToSpeech):
         except ImportError as exc:
             return SpeechResult(success=False, error=f"edge-tts is not installed: {exc}")
 
+        if self._streaming_available():
+            return await self._speak_streaming(text, edge_tts)
+        return await self._speak_via_file(text, edge_tts)
+
+    # --- Fast path: synthesize sentence by sentence, decode in memory, play
+    # through the sound card directly while the next sentence is prepared.
+
+    @staticmethod
+    def _streaming_available() -> bool:
+        try:
+            import av  # noqa: F401 - PyAV ships with faster-whisper
+            import numpy  # noqa: F401
+            import sounddevice  # noqa: F401
+        except (ImportError, OSError):
+            return False
+        return True
+
+    async def _speak_streaming(self, text: str, edge_tts) -> SpeechResult:
+        chunks = split_for_speech(text)
+        # Synthesize every chunk concurrently (a few at a time) and play them
+        # in order: the first sentence starts as soon as it's ready, and the
+        # rest are usually done before they're needed, so there are no gaps.
+        limiter = asyncio.Semaphore(3)
+
+        async def synthesize(chunk: str):
+            async with limiter:
+                return await self._synthesize_chunk(edge_tts, chunk)
+
+        tasks = [asyncio.create_task(synthesize(chunk)) for chunk in chunks]
+        loop = asyncio.get_running_loop()
+        played_any = False
+        effect_applied = False
+        try:
+            for index, task in enumerate(tasks):
+                try:
+                    samples, sample_rate, effect_applied = await task
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Online voice failed (%s); using the built-in Windows voice.", str(exc).split(",")[0]
+                    )
+                    fallback_error = await self._speak_with_windows_voice(" ".join(chunks[index:]))
+                    if fallback_error is not None and not played_any:
+                        return SpeechResult(
+                            success=False,
+                            error=f"Speech synthesis failed: {exc}. Try: pip install --upgrade edge-tts",
+                        )
+                    break
+                try:
+                    await loop.run_in_executor(None, self._play_samples, samples, sample_rate)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Audio playback failed")
+                    return SpeechResult(success=False, error=f"Audio playback failed: {exc}")
+                played_any = True
+        except asyncio.CancelledError:
+            self._stop_playback()  # Ctrl+C: stop talking immediately
+            raise
+        finally:
+            for task in tasks:
+                task.cancel()
+        return SpeechResult(success=True, effect_applied=effect_applied)
+
+    async def _synthesize_chunk(self, edge_tts, chunk: str):
+        data = bytearray()
+        communicate = edge_tts.Communicate(chunk, self._voice, rate=self._rate, pitch=self._pitch)
+        async for message in communicate.stream():
+            if message.get("type") == "audio":
+                data.extend(message["data"])
+        if not data:
+            raise RuntimeError("No audio was received from the voice service.")
+        return await asyncio.to_thread(self._decode_and_process, bytes(data))
+
+    def _decode_and_process(self, mp3_bytes: bytes):
+        """Decode MP3 in-process with PyAV (milliseconds; spawning ffmpeg via
+        pydub took ~20s per reply) and apply the cinematic effect in numpy."""
+        import av
+        import numpy as np
+
+        with av.open(io.BytesIO(mp3_bytes)) as container:
+            stream = container.streams.audio[0]
+            sample_rate = stream.rate or 24000
+            resampler = av.AudioResampler(format="flt", layout="mono", rate=sample_rate)
+            pieces = []
+            for frame in container.decode(stream):
+                for out in resampler.resample(frame):
+                    pieces.append(out.to_ndarray().reshape(-1))
+            for out in resampler.resample(None):  # flush
+                pieces.append(out.to_ndarray().reshape(-1))
+        samples = np.concatenate(pieces).astype(np.float64) if pieces else np.zeros(0)
+
+        effect_applied = False
+        if self._cinematic_effect and samples.size:
+            try:
+                from app.voice.audio_effects import apply_cinematic_effect
+
+                samples = apply_cinematic_effect(
+                    samples,
+                    sample_rate,
+                    boost_cutoff_hz=self._effect_boost_hz,
+                    boost_gain_db=self._effect_boost_db,
+                    mod_rate_hz=self._effect_mod_hz,
+                    mod_depth=self._effect_mod_depth,
+                    room_gain=self._effect_room,
+                )
+                effect_applied = True
+            except Exception as exc:  # noqa: BLE001
+                if not self._effect_warned:
+                    self._effect_warned = True
+                    logger.warning("Cinematic voice effect unavailable, using the plain voice: %s", exc)
+        return samples.astype(np.float32), sample_rate, effect_applied
+
+    @staticmethod
+    def _play_samples(samples, sample_rate: int) -> None:
+        import sounddevice as sd
+
+        sd.play(samples, sample_rate)
+        sd.wait()
+
+    @staticmethod
+    def _stop_playback() -> None:
+        try:
+            import sounddevice as sd
+
+            sd.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # --- Fallback path: whole reply to an MP3 file, played with pygame.
+
+    async def _speak_via_file(self, text: str, edge_tts) -> SpeechResult:
         # A unique filename per call, not a fixed shared one: on Windows,
         # pygame's mixer can hold a lingering file lock on the previous
         # mp3 for a moment after playback even after quit(), which made a
@@ -93,8 +263,18 @@ class EdgeTTSProvider(TextToSpeech):
             )
             await communicate.save(str(tmp_path))
         except Exception as exc:  # noqa: BLE001
-            logger.exception("TTS synthesis failed")
-            return SpeechResult(success=False, error=f"Speech synthesis failed: {exc}")
+            # The free Edge voice service occasionally rejects older
+            # edge-tts versions (HTTP 403) or is unreachable; fall back to
+            # the offline Windows voice rather than going silent.
+            logger.warning("Online voice failed (%s); using the built-in Windows voice.", str(exc).split(",")[0])
+            tmp_path.unlink(missing_ok=True)
+            fallback_error = await self._speak_with_windows_voice(text)
+            if fallback_error is None:
+                return SpeechResult(success=True)
+            return SpeechResult(
+                success=False,
+                error=f"Speech synthesis failed: {exc}. Try: pip install --upgrade edge-tts",
+            )
 
         playback_path = tmp_path
         effect_applied = False
@@ -103,11 +283,15 @@ class EdgeTTSProvider(TextToSpeech):
                 playback_path = self._apply_cinematic_effect(tmp_path)
                 effect_applied = True
             except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Cinematic voice effect failed, falling back to unprocessed "
-                    "audio: %s",
-                    exc,
-                )
+                # Warn once per session, not after every reply; the plain
+                # voice still plays.
+                if not self._effect_warned:
+                    self._effect_warned = True
+                    logger.warning(
+                        "Cinematic voice effect unavailable, using the plain voice: %s "
+                        "(needs pydub + ffmpeg; set TTS_CINEMATIC_EFFECT=false to silence this)",
+                        exc,
+                    )
 
         try:
             self._play(playback_path)
@@ -122,6 +306,30 @@ class EdgeTTSProvider(TextToSpeech):
                     pass  # best effort; a leftover temp file isn't worth failing over
 
         return SpeechResult(success=True, effect_applied=effect_applied)
+
+    async def _speak_with_windows_voice(self, text: str) -> str | None:
+        """Speak via Windows' built-in System.Speech (offline). Text is
+        passed on stdin, never interpolated into the script. Returns None
+        on success, or an error message."""
+        if sys.platform != "win32":
+            return "no offline voice on this platform"
+        from app.integrations.system_control import run_process
+
+        script = (
+            "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; "
+            "Add-Type -AssemblyName System.Speech; "
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            "try { $s.SelectVoiceByHints('Male') } catch {}; "
+            "$s.Speak([Console]::In.ReadToEnd())"
+        )
+        out = await run_process(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            timeout=300,
+            stdin_text=text,
+        )
+        if out.success:
+            return None
+        return out.error or out.stderr or "Windows voice failed"
 
     def _apply_cinematic_effect(self, mp3_path: Path) -> Path:
         """Decode -> apply the high-shelf boost + amplitude modulation ->
@@ -147,6 +355,7 @@ class EdgeTTSProvider(TextToSpeech):
             boost_gain_db=self._effect_boost_db,
             mod_rate_hz=self._effect_mod_hz,
             mod_depth=self._effect_mod_depth,
+            room_gain=self._effect_room,
         )
 
         dtype = np.int16 if segment.sample_width == 2 else np.int32

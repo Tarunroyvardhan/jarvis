@@ -31,11 +31,20 @@ class GoogleAuthError(Exception):
     pass
 
 
-def get_credentials(credentials_path: Path, token_path: Path):
+class GoogleLoginRequired(GoogleAuthError):
+    """No usable cached token and interactive sign-in wasn't allowed."""
+
+
+def get_credentials(credentials_path: Path, token_path: Path, interactive: bool = True):
     """Return valid Google credentials, refreshing or running the OAuth
     browser flow as needed. Caches the resulting token to `token_path` so
     this only prompts a real login once (until the token is revoked or
-    deleted).
+    expires — tokens for apps in Google's "Testing" mode expire after 7
+    days).
+
+    With interactive=False (used at startup) it never opens a browser: it
+    raises GoogleLoginRequired instead, so an expired token can't block
+    Jarvis from starting while a sign-in page waits in the background.
     """
     try:
         from google.auth.transport.requests import Request
@@ -66,19 +75,30 @@ def get_credentials(credentials_path: Path, token_path: Path):
             try:
                 creds.refresh(Request())
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Token refresh failed (%s); re-running login flow.", exc)
+                logger.info("Google token refresh failed (%s); a new sign-in is needed.", exc)
                 creds = None
 
+        if (not creds or not creds.valid) and not interactive:
+            raise GoogleLoginRequired("Google sign-in has expired or hasn't been done yet.")
+
         if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
             print(
                 "Opening a browser window for Google sign-in — grant Jarvis "
                 "access to Calendar and Gmail to continue..."
             )
-            creds = flow.run_local_server(port=0)
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
+                creds = flow.run_local_server(port=0, timeout_seconds=300)
+            except Exception as exc:  # noqa: BLE001 - a failed login must not crash startup
+                raise GoogleAuthError(f"Google sign-in did not complete: {exc}") from exc
+            if creds is None:
+                raise GoogleAuthError("Google sign-in timed out or was cancelled.")
 
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(creds.to_json())
+        try:
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+            token_path.write_text(creds.to_json())
+        except OSError as exc:
+            logger.warning("Could not cache Google token at %s: %s", token_path, exc)
 
     return creds
 

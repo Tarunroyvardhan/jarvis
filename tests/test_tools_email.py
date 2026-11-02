@@ -76,15 +76,20 @@ async def test_send_email_describe_shows_recipient_subject_and_preview():
 
 
 @pytest.mark.asyncio
-async def test_send_email_describe_truncates_long_body():
+async def test_send_email_describe_shows_full_body():
+    """Regression: the confirmation used to show only the first 100
+    characters, so the user approved sending an email they hadn't read."""
     fake_service = AsyncMock()
     tool = SendEmailTool(email_service=fake_service)
 
-    long_body = "x" * 500
-    description = await tool.describe(to="bob@example.com", subject="Long", body=long_body)
+    body = "x" * 500
+    description = await tool.describe(to="bob@example.com", subject="Long", body=body)
+    assert body in description
 
-    assert len(description) < 500 + 100  # truncated, not the full 500 chars
-    assert "..." in description
+    huge = "y" * 5000
+    description = await tool.describe(to="bob@example.com", subject="Huge", body=huge)
+    assert len(description) < 3300
+    assert "more characters" in description
 
 
 @pytest.mark.asyncio

@@ -10,3 +10,6 @@ data/*.db
 data/*.sqlite3
 .DS_Store
 *.egg-info/
+# Local runtime data
+data/
+jarvis.egg-info/

@@ -64,6 +64,25 @@ def _normalize_if_clipping(samples: np.ndarray) -> np.ndarray:
     return samples
 
 
+def apply_room_sheen(
+    samples: np.ndarray,
+    sample_rate: int,
+    gain: float = 0.12,
+) -> np.ndarray:
+    """Add a few faint, very short reflections (11-37 ms) — the polished,
+    "voice in the room" quality of a film AI, without the buzzy, robotic
+    character that amplitude modulation gives. `gain` ~0.1-0.2 is subtle.
+    """
+    if gain <= 0:
+        return samples
+    out = samples.astype(np.float64, copy=True)
+    for delay_ms, tap_gain in ((11, 1.0), (23, 0.6), (37, 0.35)):
+        delay = int(sample_rate * delay_ms / 1000)
+        if 0 < delay < len(out):
+            out[delay:] += samples[:-delay] * gain * tap_gain
+    return _normalize_if_clipping(out)
+
+
 def apply_cinematic_effect(
     samples: np.ndarray,
     sample_rate: int,
@@ -71,8 +90,12 @@ def apply_cinematic_effect(
     boost_gain_db: float = 1.5,
     mod_rate_hz: float = 50.0,
     mod_depth: float = 0.05,
+    room_gain: float = 0.0,
 ) -> np.ndarray:
-    """Convenience wrapper applying both effects in sequence."""
-    boosted = apply_high_shelf_boost(samples, sample_rate, boost_cutoff_hz, boost_gain_db)
-    modulated = apply_amplitude_modulation(boosted, sample_rate, mod_rate_hz, mod_depth)
-    return _normalize_if_clipping(modulated)
+    """Presence boost, optional room sheen, optional amplitude modulation."""
+    processed = apply_high_shelf_boost(samples, sample_rate, boost_cutoff_hz, boost_gain_db)
+    if room_gain > 0:
+        processed = apply_room_sheen(processed, sample_rate, room_gain)
+    if mod_depth > 0:
+        processed = apply_amplitude_modulation(processed, sample_rate, mod_rate_hz, mod_depth)
+    return _normalize_if_clipping(processed)

@@ -9,16 +9,17 @@ prohibition.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.integrations.system_control import run_process
 from app.security.path_guard import PathAccessError, PathGuard
 
 logger = logging.getLogger(__name__)
 
 SUBPROCESS_TIMEOUT_SECONDS = 60
+TEST_TIMEOUT_SECONDS = 600
 
 
 @dataclass(frozen=True)
@@ -40,34 +41,17 @@ class DevToolsService:
             raise PathAccessError(f"'{resolved}' is not a git repository.")
         return resolved
 
-    async def _run(self, args: list[str], cwd: Path) -> DevToolsResult:
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *args,
-                cwd=str(cwd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=SUBPROCESS_TIMEOUT_SECONDS
-            )
-        except asyncio.TimeoutError:
+    async def _run(self, args: list[str], cwd: Path, timeout: float = SUBPROCESS_TIMEOUT_SECONDS) -> DevToolsResult:
+        out = await run_process(args, cwd=cwd, timeout=timeout)
+        if out.error:
+            return DevToolsResult(success=False, error=out.error)
+
+        if out.exit_code != 0 and not out.stdout.strip():
             return DevToolsResult(
-                success=False, error=f"Command timed out after {SUBPROCESS_TIMEOUT_SECONDS}s."
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Command failed: %s", args)
-            return DevToolsResult(success=False, error=str(exc))
-
-        output = stdout.decode("utf-8", errors="replace")
-        error_output = stderr.decode("utf-8", errors="replace")
-
-        if process.returncode != 0 and not output.strip():
-            return DevToolsResult(
-                success=False, error=error_output or f"Command exited with code {process.returncode}"
+                success=False, error=out.stderr or f"Command exited with code {out.exit_code}"
             )
 
-        return DevToolsResult(success=True, output=output or error_output)
+        return DevToolsResult(success=True, output=out.stdout or out.stderr)
 
     async def git_status(self, project_path: str) -> DevToolsResult:
         try:
@@ -81,7 +65,7 @@ class DevToolsService:
             repo = self._resolve_project(project_path)
         except PathAccessError as exc:
             return DevToolsResult(success=False, error=str(exc))
-        args = ["git", "diff"] + (["--staged"] if staged else [])
+        args = ["git", "--no-pager", "diff"] + (["--staged"] if staged else [])
         return await self._run(args, cwd=repo)
 
     async def run_tests(self, project_path: str, test_command: list[str]) -> DevToolsResult:
@@ -93,4 +77,4 @@ class DevToolsService:
         if not test_command:
             return DevToolsResult(success=False, error="No test command configured for this project.")
 
-        return await self._run(test_command, cwd=repo)
+        return await self._run(test_command, cwd=repo, timeout=TEST_TIMEOUT_SECONDS)

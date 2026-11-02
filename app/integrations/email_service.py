@@ -16,8 +16,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 from dataclasses import dataclass, field
 from email.mime.text import MIMEText
+from html import unescape
 
 logger = logging.getLogger(__name__)
 
@@ -57,16 +59,29 @@ def _header(headers: list[dict], name: str) -> str:
     return ""
 
 
+def _html_to_text(html: str) -> str:
+    html = re.sub(r"(?is)<(script|style|head)[^>]*>.*?</\1>", " ", html)
+    html = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</h\d>", "\n", html)
+    text = unescape(re.sub(r"<[^>]+>", " ", html))
+    text = re.sub(r"[ \t\f\v]+", " ", text)
+    return re.sub(r"\n\s*\n+", "\n\n", text).strip()
+
+
+def _decode(data: str) -> str:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode("utf-8", errors="replace")
+
+
 def _extract_body(payload: dict) -> str:
     if payload.get("body", {}).get("data"):
-        return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
+        text = _decode(payload["body"]["data"])
+        return _html_to_text(text) if payload.get("mimeType") == "text/html" else text
 
     for part in payload.get("parts") or []:
         if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
-            return base64.urlsafe_b64decode(part["body"]["data"]).decode(
-                "utf-8", errors="replace"
-            )
+            return _decode(part["body"]["data"])
     for part in payload.get("parts") or []:
+        if part.get("mimeType") == "text/plain":
+            continue  # already tried above; empty plain part
         nested = _extract_body(part)
         if nested:
             return nested
@@ -74,7 +89,7 @@ def _extract_body(payload: dict) -> str:
 
 
 def _build_mime(to: str, subject: str, body: str) -> dict:
-    message = MIMEText(body)
+    message = MIMEText(body, "plain", "utf-8")
     message["to"] = to
     message["subject"] = subject
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()

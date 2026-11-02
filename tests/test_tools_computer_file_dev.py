@@ -15,6 +15,7 @@ from app.tools.file_tools import DeleteFileTool, FindFilesTool
 async def test_open_application_tool_success():
     fake_controller = AsyncMock()
     fake_controller.open_application = lambda name: ComputerActionResult(success=True)
+    fake_controller.is_allowed = lambda name: True
 
     tool = OpenApplicationTool(controller=fake_controller)
     result = await tool.execute(name="notepad")
@@ -28,6 +29,7 @@ async def test_open_application_tool_propagates_failure():
     fake_controller.open_application = lambda name: ComputerActionResult(
         success=False, error="not allowed"
     )
+    fake_controller.is_allowed = lambda name: True
 
     tool = OpenApplicationTool(controller=fake_controller)
     result = await tool.execute(name="unknown")
@@ -46,7 +48,7 @@ async def test_open_website_tool_is_low_risk_not_gated():
 @pytest.mark.asyncio
 async def test_find_files_tool_formats_results():
     fake_service = AsyncMock()
-    fake_service.find_files = lambda query, directory=None: FileResult(
+    fake_service.find_files = lambda query, directory=None, **kw: FileResult(
         success=True,
         files=[FileEntry(path="/tmp/a.txt", name="a.txt", size_bytes=10, modified_at="now")],
     )

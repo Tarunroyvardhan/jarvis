@@ -1,10 +1,10 @@
 [project]
 name = "jarvis"
 version = "0.1.0"
-description = "Personal AI assistant, built incrementally."
+description = "Personal AI assistant with computer control, web research and automation."
 requires-python = ">=3.11"
 dependencies = [
-    "anthropic>=0.40.0",
+    "anthropic>=0.121.0",
     "python-dotenv>=1.0.0",
     "httpx>=0.27.0",
     "feedparser>=6.0.10",
@@ -19,7 +19,8 @@ voice = [
     "faster-whisper>=1.0.0",
     "sounddevice>=0.4.6",
     "numpy>=1.26.0",
-    "edge-tts>=6.1.0",
+    "edge-tts>=7.3.1",
+    "piper-tts>=1.3.0",
     "pygame>=2.5.0",
     "openwakeword>=0.6.0",
     "onnxruntime>=1.16.0",
@@ -35,9 +36,23 @@ files = [
     "pypdf>=4.0.0",
     "python-docx>=1.1.0",
 ]
+system = [
+    "psutil>=5.9.0",
+    "pillow>=10.0.0",
+]
+browser = [
+    "playwright>=1.45.0",
+]
+all = [
+    "jarvis[voice,google,files,system,browser]",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = ["streaming: exercises the in-memory streaming TTS path"]
 
-[tool.setuptools]
-packages = ["app", "jarvis"]
+[project.scripts]
+jarvis = "jarvis.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["app*", "jarvis*"]

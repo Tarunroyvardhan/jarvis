@@ -28,7 +28,10 @@ class CreateReminderTool(Tool):
         "ISO 8601 datetime (YYYY-MM-DDTHH:MM:SS) based on the user's request "
         "and the current time — e.g. 'in 20 minutes' or 'tomorrow at 8pm'. "
         "Use recurrence='daily' or 'weekly' for recurring reminders; "
-        "trigger_at is then the first occurrence."
+        "trigger_at is then the first occurrence. Set task_prompt to turn the "
+        "reminder into an automation: when it fires, you will be given that "
+        "instruction and carry it out (e.g. 'Give me a briefing: weather in "
+        "Toronto, my calendar for today, and top tech news')."
     )
     permission_level = PermissionLevel.LOW_RISK
     parameters = [
@@ -45,6 +48,16 @@ class CreateReminderTool(Tool):
             required=False,
             enum=_RECURRENCE_CHOICES,
         ),
+        ToolParameter(
+            name="task_prompt",
+            type="string",
+            description=(
+                "Optional instruction for you to carry out automatically when the "
+                "reminder fires. Actions needing confirmation are refused during "
+                "automated runs, so keep these to read/report style tasks."
+            ),
+            required=False,
+        ),
     ]
 
     def __init__(self, repository: ReminderRepository) -> None:
@@ -55,6 +68,7 @@ class CreateReminderTool(Tool):
         message: str,
         trigger_at: str,
         recurrence: str = "none",
+        task_prompt: str | None = None,
         **kwargs: Any,
     ) -> ToolResult:
         try:
@@ -71,13 +85,16 @@ class CreateReminderTool(Tool):
             return ToolResult(success=False, error=f"Invalid recurrence: '{recurrence}'")
 
         try:
-            reminder = self._repo.create(message=message, trigger_at=when, recurrence=recurrence_type)
+            reminder = self._repo.create(
+                message=message, trigger_at=when, recurrence=recurrence_type, task_prompt=task_prompt
+            )
         except ValueError as exc:
             return ToolResult(success=False, error=str(exc))
 
+        kind = "Automation" if reminder.task_prompt else "Reminder"
         return ToolResult(
             success=True,
-            result=f"Reminder set (id={reminder.id}) for {reminder.trigger_at.isoformat()}.",
+            result=f"{kind} set (id={reminder.id}) for {reminder.trigger_at.isoformat()}.",
             metadata={"id": reminder.id},
         )
 
@@ -99,6 +116,7 @@ class ListRemindersTool(Tool):
                 "message": r.message,
                 "trigger_at": r.trigger_at.isoformat(),
                 "recurrence": r.recurrence.value,
+                "task_prompt": r.task_prompt,
             }
             for r in reminders
         ]

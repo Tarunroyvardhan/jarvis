@@ -115,7 +115,16 @@ class RecallTool(Tool):
             except ValueError:
                 return ToolResult(success=False, error=f"Invalid memory type: '{type}'")
 
-        memories = self._repo.retrieve(type=memory_type, query=query, limit=10)
+        if query:
+            # Phrase match first, then any-keyword match for looser queries.
+            memories = self._repo.retrieve(type=memory_type, query=query, limit=10)
+            if not memories:
+                memories = [
+                    m for m in self._repo.search(query, limit=10)
+                    if memory_type is None or m.type == memory_type
+                ]
+        else:
+            memories = self._repo.retrieve(type=memory_type, limit=10)
         results = [
             {"id": m.id, "content": m.content, "type": m.type.value, "permanent": m.is_permanent}
             for m in memories

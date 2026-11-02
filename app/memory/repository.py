@@ -18,6 +18,7 @@ callers changing.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,6 +27,14 @@ from app.memory.models import Memory, MemoryType
 from app.storage.db import get_connection, init_schema
 
 DEFAULT_AUTO_MEMORY_TTL_DAYS = 7
+
+_STOPWORDS = {
+    "the", "and", "for", "you", "your", "are", "was", "what", "when", "where", "which",
+    "who", "how", "can", "could", "would", "should", "with", "that", "this", "have",
+    "has", "had", "not", "but", "about", "from", "they", "them", "there", "their",
+    "please", "jarvis", "tell", "give", "get", "does", "did", "any", "some", "into",
+    "out", "all", "just", "now", "today", "remember", "know", "like", "want", "need",
+}
 
 
 def _row_to_memory(row: sqlite3.Row) -> Memory:
@@ -124,6 +133,46 @@ class MemoryRepository:
             params.append(limit)
 
             rows = conn.execute(sql, params).fetchall()
+            return [_row_to_memory(r) for r in rows]
+        finally:
+            conn.close()
+
+    def search(
+        self,
+        text: str,
+        limit: int = 10,
+        exclude_type: MemoryType | None = None,
+        include_expired: bool = False,
+    ) -> list[Memory]:
+        """Keyword search: memories matching ANY meaningful word of `text`,
+        ranked by how many words they match, then importance and recency.
+        Unlike retrieve(query=...), which needs the whole phrase verbatim,
+        this finds "likes dark roast coffee" for "what coffee do I like?".
+        """
+        words = sorted(
+            {w for w in re.findall(r"[\w'-]+", text.lower()) if len(w) > 2 and w not in _STOPWORDS}
+        )[:12]
+        if not words:
+            return []
+
+        conn = self._connect()
+        try:
+            patterns = [f"%{w}%" for w in words]
+            score = " + ".join("(LOWER(content) LIKE ?)" for _ in words)
+            clauses = ["score > 0"]
+            filter_params: list = []
+            if exclude_type is not None:
+                clauses.append("type != ?")
+                filter_params.append(exclude_type.value)
+            if not include_expired:
+                clauses.append("(expires_at IS NULL OR expires_at > ?)")
+                filter_params.append(datetime.now().isoformat())
+            sql = (
+                f"SELECT * FROM (SELECT *, ({score}) AS score FROM memories) "
+                f"WHERE {' AND '.join(clauses)} "
+                "ORDER BY score DESC, importance DESC, created_at DESC LIMIT ?"
+            )
+            rows = conn.execute(sql, [*patterns, *filter_params, limit]).fetchall()
             return [_row_to_memory(r) for r in rows]
         finally:
             conn.close()

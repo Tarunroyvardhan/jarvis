@@ -1,6 +1,6 @@
 import pytest
 
-from app.core.assistant import Assistant, MAX_TOOL_ITERATIONS
+from app.core.assistant import Assistant
 from app.llm.base import LLMResponse, Role, ToolCallRequest
 from app.security.permissions import PermissionLevel
 from app.tools.base import Tool, ToolResult
@@ -76,16 +76,146 @@ async def test_chat_maintains_short_term_history():
 
 
 @pytest.mark.asyncio
-async def test_history_trims_to_max_length():
-    llm = FakeLLMProvider(reply="ok")
-    assistant = Assistant(llm=llm, name="Jarvis", max_history_messages=2)
+async def test_history_is_append_only_and_never_splits_tool_pairs():
+    """Regression: history used to be trimmed to the last N messages, which
+    could cut between a tool_use and its tool_result (an API 400) and
+    invalidated cached prefixes. History is now append-only; long
+    conversations are compacted server-side instead."""
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    tool_call = LLMResponse(
+        success=True,
+        content="",
+        tool_calls=[ToolCallRequest(id="c1", name="echo", input={"text": "x"})],
+        stop_reason="tool_use",
+        raw_blocks=[{"type": "tool_use", "id": "c1", "name": "echo", "input": {"text": "x"}}],
+    )
+    llm = FakeLLMProvider(
+        responses=[
+            LLMResponse(success=True, content="a"),
+            tool_call,
+            LLMResponse(success=True, content="b"),
+            LLMResponse(success=True, content="c"),
+        ]
+    )
+    assistant = Assistant(llm=llm, tool_registry=registry, name="Jarvis")
 
     await assistant.chat("one")
     await assistant.chat("two")
+    first_turn_snapshot = list(llm.calls[-1][0])
     await assistant.chat("three")
 
     sent_messages, _, _ = llm.calls[-1]
-    assert len(sent_messages) <= 2
+    # Every earlier message is sent again, unchanged and in order.
+    assert sent_messages[: len(first_turn_snapshot)] == first_turn_snapshot
+    assert len(sent_messages) == 7  # u, a, u, a(tool_use), u(tool_result), a, u
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_is_identical_across_turns():
+    """Volatile context (time, memories) lives in the user message so the
+    system prompt stays byte-identical, keeping prompt caching effective."""
+    llm = FakeLLMProvider(reply="ok")
+    assistant = Assistant(llm=llm, name="Jarvis")
+
+    await assistant.chat("one")
+    await assistant.chat("two")
+
+    assert llm.calls[0][1] == llm.calls[1][1]
+
+
+@pytest.mark.asyncio
+async def test_pause_turn_is_resumed_by_resending():
+    paused = LLMResponse(
+        success=True,
+        content="",
+        stop_reason="pause_turn",
+        raw_blocks=[{"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {"query": "x"}}],
+        activity=['web_search: "x"'],
+    )
+    final = LLMResponse(success=True, content="Found it.", stop_reason="end_turn")
+    llm = FakeLLMProvider(responses=[paused, final])
+    notes = []
+    assistant = Assistant(llm=llm, name="Jarvis", progress_callback=notes.append)
+
+    response = await assistant.chat("search something")
+
+    assert response.success is True
+    assert response.content == "Found it."
+    assert len(llm.calls) == 2
+    # The paused assistant turn is replayed as the last message.
+    assert llm.calls[1][0][-1].raw_blocks == paused.raw_blocks
+    assert notes == ['web_search: "x"']
+
+
+@pytest.mark.asyncio
+async def test_failed_tool_result_includes_metadata_for_the_model():
+    class Ambiguous(Tool):
+        name = "ambiguous"
+        description = "fails with candidates"
+        permission_level = PermissionLevel.READ_ONLY
+        parameters = []
+
+        async def execute(self, **kwargs):
+            return ToolResult(success=False, error="Multiple match", metadata={"candidates": [{"id": 7}]})
+
+    registry = ToolRegistry()
+    registry.register(Ambiguous())
+    call = LLMResponse(
+        success=True,
+        content="",
+        tool_calls=[ToolCallRequest(id="c1", name="ambiguous", input={})],
+        stop_reason="tool_use",
+        raw_blocks=[{"type": "tool_use", "id": "c1", "name": "ambiguous", "input": {}}],
+    )
+    llm = FakeLLMProvider(responses=[call, LLMResponse(success=True, content="ok")])
+    assistant = Assistant(llm=llm, tool_registry=registry, name="Jarvis")
+
+    await assistant.chat("go")
+
+    tool_result = llm.calls[1][0][-1].raw_blocks[0]
+    assert tool_result["is_error"] is True
+    assert '"id": 7' in tool_result["content"]
+
+
+@pytest.mark.asyncio
+async def test_large_tool_results_are_truncated():
+    from app.core.assistant import MAX_TOOL_RESULT_CHARS
+
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    call = LLMResponse(
+        success=True,
+        content="",
+        tool_calls=[ToolCallRequest(id="c1", name="echo", input={"text": "x" * (MAX_TOOL_RESULT_CHARS + 500)})],
+        stop_reason="tool_use",
+        raw_blocks=[{"type": "tool_use", "id": "c1", "name": "echo", "input": {}}],
+    )
+    llm = FakeLLMProvider(responses=[call, LLMResponse(success=True, content="ok")])
+    assistant = Assistant(llm=llm, tool_registry=registry, name="Jarvis")
+
+    await assistant.chat("go")
+
+    content = llm.calls[1][0][-1].raw_blocks[0]["content"]
+    assert len(content) < MAX_TOOL_RESULT_CHARS + 200
+    assert "truncated" in content
+
+
+@pytest.mark.asyncio
+async def test_cancelled_turn_is_rolled_back():
+    import asyncio
+
+    class SlowLLM(FakeLLMProvider):
+        async def complete(self, messages, system_prompt=None, tools=None):
+            await asyncio.sleep(10)
+
+    assistant = Assistant(llm=SlowLLM(), name="Jarvis")
+    task = asyncio.create_task(assistant.chat("hello"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert assistant._history == []
 
 
 @pytest.mark.asyncio
@@ -159,8 +289,8 @@ async def test_tool_loop_gives_up_after_max_iterations():
         stop_reason="tool_use",
         raw_blocks=[{"type": "tool_use", "id": "call_x", "name": "echo", "input": {"text": "x"}}],
     )
-    llm = FakeLLMProvider(responses=[looping_response] * MAX_TOOL_ITERATIONS)
-    assistant = Assistant(llm=llm, tool_registry=registry, name="Jarvis")
+    llm = FakeLLMProvider(responses=[looping_response] * 3)
+    assistant = Assistant(llm=llm, tool_registry=registry, name="Jarvis", max_tool_iterations=3)
 
     response = await assistant.chat("loop forever")
 
@@ -170,12 +300,15 @@ async def test_tool_loop_gives_up_after_max_iterations():
 
 
 @pytest.mark.asyncio
-async def test_system_prompt_includes_current_time():
+async def test_turn_context_includes_current_time():
     llm = FakeLLMProvider(reply="ok")
     assistant = Assistant(llm=llm, name="Jarvis")
 
-    prompt = assistant.system_prompt
-    assert "Current date and time:" in prompt
+    await assistant.chat("hello")
+
+    first_user_message = llm.calls[0][0][0]
+    assert "Current local date and time:" in first_user_message.raw_blocks[0]["text"]
+    assert first_user_message.raw_blocks[1]["text"] == "hello"
 
 
 @pytest.mark.asyncio
@@ -200,7 +333,8 @@ async def test_system_prompt_includes_relevant_memories(tmp_path):
     llm = FakeLLMProvider(reply="ok")
     assistant = Assistant(llm=llm, memory_repository=repo, name="Jarvis")
 
-    assert "prefers morning meetings" in assistant.system_prompt
+    assert "prefers morning meetings" in assistant.build_turn_context("anything")
+    assert "prefers morning meetings" not in assistant.system_prompt
 
 
 @pytest.mark.asyncio
@@ -211,7 +345,7 @@ async def test_system_prompt_has_no_memory_section_when_nothing_stored(tmp_path)
     llm = FakeLLMProvider(reply="ok")
     assistant = Assistant(llm=llm, memory_repository=repo, name="Jarvis")
 
-    assert "Things you know about the user" not in assistant.system_prompt
+    assert "Things you know about the user" not in assistant.build_turn_context("hello")
 
 
 @pytest.mark.asyncio

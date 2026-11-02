@@ -31,6 +31,9 @@ class ToolResult:
     result: Any = None
     error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Optional extra content blocks (e.g. a screenshot as an image block)
+    # sent to the model alongside the textual result.
+    content_blocks: list[dict] | None = None
 
 
 class Tool(ABC):
@@ -45,6 +48,15 @@ class Tool(ABC):
     async def execute(self, **kwargs: Any) -> ToolResult:
         """Run the tool. Must catch its own exceptions and return ToolResult."""
         raise NotImplementedError
+
+    def permission_for(self, **kwargs: Any) -> PermissionLevel:
+        """Permission level for this specific call. Defaults to the tool's
+        static level; tools whose risk depends on the arguments (e.g.
+        writing a new file vs. overwriting one) override this. It can only
+        ever be used to make a call *stricter* — the registry takes the
+        max of this and the static level.
+        """
+        return self.permission_level
 
     async def describe(self, **kwargs: Any) -> str:
         """Human-readable summary of what this specific call would do,

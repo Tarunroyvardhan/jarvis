@@ -150,3 +150,142 @@ def record_until_silence(
     tmp_path = Path(tempfile.gettempdir()) / "jarvis_recording.wav"
     _write_wav(audio, samplerate, tmp_path)
     return str(tmp_path)
+
+
+class RecordingStopped(Exception):
+    """record_utterance() was asked to stop via its stop_event."""
+
+
+class UtteranceSegmenter:
+    """Pure state machine that splits a stream of audio-chunk loudness
+    values into one utterance: idle until speech starts, then speaking
+    until enough trailing silence. Extracted from record_utterance() so
+    the logic is testable without a microphone.
+
+    The speech threshold adapts to the room: the first `calibration_chunks`
+    measure background noise, and speech must be clearly louder than that
+    (but never quieter than `min_threshold`).
+    """
+
+    def __init__(
+        self,
+        min_threshold: float = 300.0,
+        noise_multiplier: float = 2.5,
+        calibration_chunks: int = 3,
+        silence_chunks_needed: int = 8,
+        min_speech_chunks: int = 3,
+        max_speech_chunks: int = 300,
+    ) -> None:
+        self.min_threshold = min_threshold
+        self.noise_multiplier = noise_multiplier
+        self.calibration_chunks = calibration_chunks
+        self.silence_chunks_needed = silence_chunks_needed
+        self.min_speech_chunks = min_speech_chunks
+        self.max_speech_chunks = max_speech_chunks
+        self._noise_samples: list[float] = []
+        self.threshold = min_threshold
+        self.speaking = False
+        self._speech_chunks = 0
+        self._loud_chunks = 0
+        self._silent_run = 0
+
+    def feed(self, rms: float) -> str:
+        """Feed one chunk's RMS. Returns "idle" (no speech yet; caller may
+        keep it as lead-in), "speech" (part of the utterance), or "done"
+        (utterance complete, including this chunk)."""
+        if len(self._noise_samples) < self.calibration_chunks and not self.speaking:
+            self._noise_samples.append(rms)
+            # The quietest chunk, not the median: if the user starts talking
+            # straight after the wake word (or over the chime), their voice
+            # must not be mistaken for background noise.
+            noise = min(self._noise_samples)
+            self.threshold = max(self.min_threshold, noise * self.noise_multiplier)
+            return "idle"
+
+        if not self.speaking:
+            if rms >= self.threshold:
+                self.speaking = True
+                self._speech_chunks = 1
+                self._loud_chunks = 1
+                return "speech"
+            return "idle"
+
+        self._speech_chunks += 1
+        if rms >= self.threshold:
+            self._loud_chunks += 1
+            self._silent_run = 0
+        else:
+            self._silent_run += 1
+
+        if self._speech_chunks >= self.max_speech_chunks:
+            return "done"
+        if self._silent_run >= self.silence_chunks_needed:
+            if self._loud_chunks < self.min_speech_chunks:
+                # A click or cough, not speech: go back to waiting.
+                self.speaking = False
+                self._speech_chunks = self._loud_chunks = self._silent_run = 0
+                return "idle"
+            return "done"
+        return "speech"
+
+
+def record_utterance(
+    stop_event=None,
+    samplerate: int = SAMPLE_RATE,
+    silence_seconds: float = 0.8,
+    max_seconds: float = 30.0,
+    pre_roll_seconds: float = 0.4,
+    min_threshold: float = 300.0,
+) -> str:
+    """Wait (indefinitely) for the user to start speaking, record until they
+    pause for `silence_seconds`, and return a WAV path for that sentence.
+
+    Keeps a short lead-in from before speech was detected so the first
+    syllable isn't clipped. Raises RecordingStopped if `stop_event` (a
+    threading.Event) is set while waiting/recording, MicrophoneError on
+    audio failures.
+    """
+    from collections import deque
+
+    np, sd = _import_audio_deps()
+
+    chunk_seconds = CHUNK_SAMPLES / samplerate
+    segmenter = UtteranceSegmenter(
+        min_threshold=min_threshold,
+        silence_chunks_needed=max(1, int(silence_seconds / chunk_seconds)),
+        max_speech_chunks=max(1, int(max_seconds / chunk_seconds)),
+    )
+    pre_roll: deque = deque(maxlen=max(1, int(pre_roll_seconds / chunk_seconds)))
+    frames: list = []
+
+    try:
+        with sd.InputStream(samplerate=samplerate, channels=CHANNELS, dtype="int16") as stream:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise RecordingStopped()
+                chunk, overflowed = stream.read(CHUNK_SAMPLES)
+                if overflowed:
+                    logger.debug("Audio input buffer overflowed.")
+                chunk = chunk.copy()
+                rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
+                state = segmenter.feed(rms)
+                if state == "idle":
+                    if frames:  # false start (a click) — discard it
+                        frames = []
+                    pre_roll.append(chunk)
+                    continue
+                if not frames:
+                    frames.extend(pre_roll)
+                    pre_roll.clear()
+                frames.append(chunk)
+                if state == "done":
+                    break
+    except RecordingStopped:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise MicrophoneError(f"Could not record audio: {exc}") from exc
+
+    audio = np.concatenate(frames, axis=0)
+    tmp_path = Path(tempfile.gettempdir()) / "jarvis_utterance.wav"
+    _write_wav(audio, samplerate, tmp_path)
+    return str(tmp_path)

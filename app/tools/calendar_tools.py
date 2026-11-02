@@ -9,7 +9,10 @@ from app.tools.base import Tool, ToolParameter, ToolResult
 
 class GetCalendarEventsTool(Tool):
     name = "get_calendar_events"
-    description = "List upcoming calendar events."
+    description = (
+        "List calendar events, from now onward by default. Pass time_min/time_max "
+        "(ISO 8601, e.g. 2026-08-10T00:00:00) to look at a specific day or range."
+    )
     permission_level = PermissionLevel.READ_ONLY
     parameters = [
         ToolParameter(
@@ -18,13 +21,23 @@ class GetCalendarEventsTool(Tool):
             description="Maximum number of events to return.",
             required=False,
         ),
+        ToolParameter(name="time_min", type="string", description="Range start (ISO 8601).", required=False),
+        ToolParameter(name="time_max", type="string", description="Range end (ISO 8601).", required=False),
     ]
 
     def __init__(self, calendar_service: CalendarService) -> None:
         self._service = calendar_service
 
-    async def execute(self, max_results: int = 10, **kwargs: Any) -> ToolResult:
-        result = await self._service.list_upcoming_events(max_results=max_results)
+    async def execute(
+        self,
+        max_results: int = 10,
+        time_min: str | None = None,
+        time_max: str | None = None,
+        **kwargs: Any,
+    ) -> ToolResult:
+        result = await self._service.list_upcoming_events(
+            max_results=min(max_results, 100), time_min=time_min, time_max=time_max
+        )
         if not result.success:
             return ToolResult(success=False, error=result.error)
 
@@ -52,12 +65,12 @@ class CreateCalendarEventTool(Tool):
         ToolParameter(
             name="start",
             type="string",
-            description="Start time in ISO 8601 format with timezone offset, e.g. 2026-08-10T14:00:00-04:00.",
+            description="Start time in ISO 8601, e.g. 2026-08-10T14:00:00 (local time if no offset).",
         ),
         ToolParameter(
             name="end",
             type="string",
-            description="End time in ISO 8601 format with timezone offset.",
+            description="End time in ISO 8601 (local time if no offset).",
         ),
         ToolParameter(
             name="location", type="string", description="Event location.", required=False

@@ -106,8 +106,9 @@ class SendEmailTool(Tool):
     async def describe(
         self, to: str = "", subject: str = "", body: str = "", **kwargs: Any
     ) -> str:
-        preview = body if len(body) <= 100 else body[:97] + "..."
-        return f'Send email to {to}, subject "{subject}":\n{preview}'
+        # Show the whole message: the user is approving exactly what goes out.
+        preview = body if len(body) <= 3000 else body[:3000] + f"\n[... {len(body) - 3000} more characters]"
+        return f'Send email to {to}, subject "{subject}":\n---\n{preview}\n---'
 
     async def execute(self, to: str, subject: str, body: str, **kwargs: Any) -> ToolResult:
         result = await self._service.send_message(to=to, subject=subject, body=body)

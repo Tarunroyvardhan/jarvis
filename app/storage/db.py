@@ -1,9 +1,10 @@
 """
 Minimal SQLite helper.
 
-Deliberately thin — no ORM yet. Phase 3 (Memory) will likely grow this
-into a proper repository layer; until then, tools that need to persist
-something (notes, tasks) talk to this directly via small, explicit SQL.
+Deliberately thin — no ORM. Repositories and the notes/tasks tools talk
+to this directly via small, explicit SQL. Each connection runs in WAL
+mode so the reminder scheduler and a tool call can touch the database at
+the same time without "database is locked" errors.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ def get_connection(db_path: Path | str) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -68,8 +71,17 @@ def init_schema(conn: sqlite3.Connection) -> None:
             recurrence TEXT NOT NULL DEFAULT 'none',
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL,
-            last_fired_at TEXT
+            last_fired_at TEXT,
+            task_prompt TEXT
         )
         """
     )
+    _add_column_if_missing(conn, "reminders", "task_prompt", "TEXT")
     conn.commit()
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """Tiny forward-only migration for databases created by older versions."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")

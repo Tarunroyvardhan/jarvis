@@ -137,3 +137,63 @@ def test_launch_terminal_denies_directory_outside_allowed_roots(tmp_path):
 def test_list_known_applications(tmp_path):
     controller = _controller(tmp_path, apps={"notepad": "notepad.exe", "vscode": "code"})
     assert controller.list_known_applications() == ["notepad", "vscode"]
+
+
+def test_allowed_app_not_on_path_is_found_the_windows_way(tmp_path, monkeypatch):
+    """Regression: 'chrome=chrome.exe' failed with WinError 2 because Chrome
+    isn't on PATH; it must be resolved like Windows does (App Paths etc.)."""
+    import app.integrations.computer_controller as cc
+
+    controller = _controller(tmp_path) if "_controller" in globals() else None
+    if controller is None:
+        from app.security.path_guard import PathGuard
+
+        controller = cc.ComputerController({"chrome": "chrome.exe"}, PathGuard([tmp_path]))
+    else:
+        controller._allowed_applications["chrome"] = "chrome.exe"
+
+    def not_on_path(args, **kwargs):
+        raise FileNotFoundError("[WinError 2]")
+
+    launched = []
+    monkeypatch.setattr(cc.subprocess, "Popen", not_on_path)
+    monkeypatch.setattr(cc.sys, "platform", "win32")
+    monkeypatch.setattr(cc, "launch_windows_app", lambda name: launched.append(name) or "C:/chrome.exe")
+
+    result = controller.open_application("chrome")
+
+    assert result.success is True
+    assert launched == ["chrome.exe"]
+
+
+def test_app_finder_prefers_exact_names():
+    from app.integrations.app_finder import _best_match
+
+    entries = (("wsl settings", "a"), ("settings", "b"), ("google chrome", "c"), ("chrome remote desktop", "d"))
+    assert _best_match("settings", entries) == "b"
+    assert _best_match("chrome", entries) == "c"
+    assert _best_match("nothing", entries) is None
+
+
+def test_real_install_path_opens_without_confirmation_but_lookalikes_ask(tmp_path, monkeypatch):
+    """Regression: Jarvis passed Chrome's full install path and got a yes/no
+    prompt. The registered install path is safe; the same name elsewhere is not."""
+    import app.integrations.computer_controller as cc
+    from app.security.path_guard import PathGuard
+    from app.security.permissions import PermissionLevel
+    from app.tools.computer_tools import OpenApplicationTool
+
+    installed = tmp_path / "Program Files" / "chrome.exe"
+    installed.parent.mkdir()
+    installed.write_text("")
+    lookalike = tmp_path / "Downloads" / "chrome.exe"
+    lookalike.parent.mkdir()
+    lookalike.write_text("")
+
+    monkeypatch.setattr(cc.sys, "platform", "win32")
+    monkeypatch.setattr(cc, "find_windows_app", lambda name: str(installed) if name == "chrome" else None)
+    tool = OpenApplicationTool(cc.ComputerController({}, PathGuard([tmp_path])))
+
+    assert tool.permission_for(name=str(installed)) == PermissionLevel.LOW_RISK
+    assert tool.permission_for(name=str(lookalike)) == PermissionLevel.CONFIRM_REQUIRED
+    assert tool.permission_for(name=str(tmp_path / "setup.exe")) == PermissionLevel.CONFIRM_REQUIRED

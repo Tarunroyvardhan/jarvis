@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 
-from app.security.permissions import PermissionChecker
+from app.security.permissions import PermissionChecker, PermissionLevel
 from app.tools.base import Tool, ToolResult
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,13 @@ class ToolRegistry:
             logger.warning("Requested unknown tool: %s", tool_name)
             return ToolResult(success=False, error=f"Unknown tool: '{tool_name}'")
 
-        if self._permissions.requires_confirmation(tool.permission_level):
+        try:
+            level = max(tool.permission_level, tool.permission_for(**kwargs))
+        except Exception:  # noqa: BLE001 - when in doubt, require confirmation
+            logger.exception("permission_for failed for tool '%s'", tool_name)
+            level = PermissionLevel.ALWAYS_CONFIRM
+
+        if self._permissions.requires_confirmation(level):
             if confirm is None:
                 logger.warning(
                     "Tool '%s' requires confirmation but no confirmation handler "
@@ -85,7 +91,11 @@ class ToolRegistry:
                     ),
                 )
 
-            description = await tool.describe(**kwargs)
+            try:
+                description = await tool.describe(**kwargs)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("describe() failed for tool '%s'", tool_name)
+                description = f"Run '{tool_name}' with {kwargs} (description unavailable: {exc})"
             try:
                 approved = await confirm(description)
             except Exception as exc:  # noqa: BLE001 - a broken confirm callback must not crash the loop
@@ -98,6 +108,10 @@ class ToolRegistry:
 
         try:
             result = await tool.execute(**kwargs)
+        except TypeError as exc:
+            # Almost always the model passing a missing/unexpected argument.
+            logger.warning("Bad arguments for tool '%s': %s", tool_name, exc)
+            return ToolResult(success=False, error=f"Invalid arguments for '{tool_name}': {exc}")
         except Exception as exc:  # noqa: BLE001 - tool internals must never crash the loop
             logger.exception("Tool '%s' raised an unhandled exception", tool_name)
             return ToolResult(success=False, error=f"Tool '{tool_name}' failed: {exc}")
@@ -105,7 +119,7 @@ class ToolRegistry:
         logger.info(
             "Tool executed: name=%s permission=%s success=%s",
             tool_name,
-            tool.permission_level.name,
+            level.name,
             result.success,
         )
         return result

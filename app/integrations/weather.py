@@ -12,7 +12,7 @@ a rewrite of callers.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -59,6 +59,8 @@ class WeatherResult:
     wind_speed: float | None = None
     unit: str = "fahrenheit"
     error: str | None = None
+    # One dict per forecast day: date, condition, high, low, precipitation_chance.
+    daily: list[dict] = field(default_factory=list)
 
 
 class WeatherService:
@@ -76,7 +78,7 @@ class WeatherService:
         # of the response to its originating request.
         self._transport = transport
 
-    async def get_current_weather(self, location: str) -> WeatherResult:
+    async def get_current_weather(self, location: str, forecast_days: int = 0) -> WeatherResult:
         if not location or not location.strip():
             return WeatherResult(success=False, error="No location provided.")
 
@@ -111,6 +113,16 @@ class WeatherService:
                         "longitude": lon,
                         "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
                         "temperature_unit": self._unit,
+                        "wind_speed_unit": "mph" if self._unit == "fahrenheit" else "kmh",
+                        **(
+                            {
+                                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                                "forecast_days": max(1, min(forecast_days, 16)),
+                                "timezone": "auto",
+                            }
+                            if forecast_days
+                            else {}
+                        ),
                     },
                 )
                 forecast_response.raise_for_status()
@@ -132,6 +144,23 @@ class WeatherService:
         code = current.get("weather_code")
         condition = WEATHER_CODE_DESCRIPTIONS.get(code, "unknown conditions")
 
+        daily_rows: list[dict] = []
+        daily = forecast_data.get("daily") or {}
+        for i, day in enumerate(daily.get("time") or []):
+            def _at(key: str, idx: int = i):
+                values = daily.get(key) or []
+                return values[idx] if idx < len(values) else None
+
+            daily_rows.append(
+                {
+                    "date": day,
+                    "condition": WEATHER_CODE_DESCRIPTIONS.get(_at("weather_code"), "unknown conditions"),
+                    "high": _at("temperature_2m_max"),
+                    "low": _at("temperature_2m_min"),
+                    "precipitation_chance": _at("precipitation_probability_max"),
+                }
+            )
+
         return WeatherResult(
             success=True,
             location_name=resolved_name or location,
@@ -141,4 +170,5 @@ class WeatherService:
             humidity=current.get("relative_humidity_2m"),
             wind_speed=current.get("wind_speed_10m"),
             unit=self._unit,
+            daily=daily_rows,
         )

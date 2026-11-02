@@ -38,10 +38,21 @@ class WhisperSTT(SpeechToText):
     for tests and for keeping app startup fast when voice isn't used.
     """
 
-    def __init__(self, model_size: str = "base", device: str = "cpu", compute_type: str = "int8") -> None:
+    def __init__(
+        self,
+        model_size: str = "base",
+        device: str = "cpu",
+        compute_type: str = "int8",
+        language: str | None = "en",
+        initial_prompt: str | None = "Jarvis",
+    ) -> None:
         self._model_size = model_size
         self._device = device
         self._compute_type = compute_type
+        # Fixing the language avoids misdetection on short clips; the
+        # prompt nudges Whisper to spell the assistant's name correctly.
+        self._language = language or None
+        self._initial_prompt = initial_prompt
         self._model = None
 
     def _get_model(self):
@@ -55,7 +66,14 @@ class WhisperSTT(SpeechToText):
     def transcribe(self, audio_path: str) -> TranscriptionResult:
         try:
             model = self._get_model()
-            segments, _info = model.transcribe(audio_path)
+            # vad_filter drops silent stretches, which otherwise make
+            # Whisper hallucinate phrases like "Thank you." from noise.
+            segments, _info = model.transcribe(
+                audio_path,
+                language=self._language,
+                initial_prompt=self._initial_prompt,
+                vad_filter=True,
+            )
             text = " ".join(segment.text.strip() for segment in segments).strip()
         except Exception as exc:  # noqa: BLE001 - surface honestly, never pretend it worked
             logger.exception("Transcription failed")

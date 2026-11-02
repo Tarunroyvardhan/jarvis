@@ -48,25 +48,46 @@ def _parse_event(item: dict) -> CalendarEvent:
     )
 
 
+def _to_rfc3339(value: str) -> str:
+    """Google requires a timezone offset on timeMin/timeMax. Accept plain
+    dates and naive datetimes (interpreted as local time) as well."""
+    parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()  # assume local time
+    return parsed.isoformat()
+
+
+def _with_local_offset(value: str) -> str:
+    """Event start/end without an offset would be rejected by the API
+    (no timeZone given), so treat them as local time."""
+    try:
+        return _to_rfc3339(value)
+    except ValueError:
+        return value
+
+
 class CalendarService:
     def __init__(self, resource) -> None:
         self._resource = resource
 
     async def list_upcoming_events(
-        self, max_results: int = 10, time_min: str | None = None
+        self, max_results: int = 10, time_min: str | None = None, time_max: str | None = None
     ) -> CalendarResult:
-        time_min = time_min or datetime.now(timezone.utc).isoformat()
+        try:
+            params = {
+                "calendarId": "primary",
+                "timeMin": _to_rfc3339(time_min) if time_min else datetime.now(timezone.utc).isoformat(),
+                "maxResults": max_results,
+                "singleEvents": True,
+                "orderBy": "startTime",
+            }
+            if time_max:
+                params["timeMax"] = _to_rfc3339(time_max)
+        except ValueError as exc:
+            return CalendarResult(success=False, error=f"Invalid date/time: {exc}")
         try:
             response = await asyncio.to_thread(
-                lambda: self._resource.events()
-                .list(
-                    calendarId="primary",
-                    timeMin=time_min,
-                    maxResults=max_results,
-                    singleEvents=True,
-                    orderBy="startTime",
-                )
-                .execute()
+                lambda: self._resource.events().list(**params).execute()
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to list calendar events")
@@ -99,8 +120,8 @@ class CalendarService:
 
         body: dict = {
             "summary": summary.strip(),
-            "start": {"dateTime": start},
-            "end": {"dateTime": end},
+            "start": {"dateTime": _with_local_offset(start)},
+            "end": {"dateTime": _with_local_offset(end)},
         }
         if description:
             body["description"] = description

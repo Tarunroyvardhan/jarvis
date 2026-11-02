@@ -17,7 +17,8 @@ def test_wake_word_threshold_defaults_to_a_lowered_value():
     of 0.5, to improve odds of catching "jarvis" alone rather than only
     the trained "hey jarvis" phrase — see README for the tradeoff."""
     s = Settings()
-    assert s.wake_word_threshold == 0.4
+    assert s.wake_word_threshold == 0.3
+    assert s.wake_word_gain == 1.0
 
 
 def test_parse_kv_list_basic():

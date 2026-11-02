@@ -28,3 +28,6 @@ class Reminder:
     status: ReminderStatus
     created_at: datetime
     last_fired_at: datetime | None = None
+    # If set, Jarvis carries out this instruction when the reminder fires
+    # (an automation) instead of only displaying `message`.
+    task_prompt: str | None = None

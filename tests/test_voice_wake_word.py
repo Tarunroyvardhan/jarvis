@@ -143,3 +143,26 @@ def test_score_frame_defaults_to_zero_for_missing_key(monkeypatch):
     score = detector.score_frame([0] * 1280)
 
     assert score == 0.0
+
+
+def test_should_trigger_on_a_single_clear_detection():
+    from app.voice.wake_word import should_trigger
+
+    assert should_trigger([0.0, 0.05, 0.31], threshold=0.3)
+
+
+def test_should_trigger_on_repeated_near_misses():
+    """A real but quiet/fast "hey jarvis" often hovers just under the
+    threshold for a few frames; that should still count."""
+    from app.voice.wake_word import should_trigger
+
+    assert should_trigger([0.2, 0.22, 0.05], threshold=0.3)
+    assert should_trigger([0.0, 0.19, 0.25], threshold=0.3)
+
+
+def test_should_not_trigger_on_noise_or_a_single_blip():
+    from app.voice.wake_word import should_trigger
+
+    assert not should_trigger([], threshold=0.3)
+    assert not should_trigger([0.01, 0.02, 0.03], threshold=0.3)
+    assert not should_trigger([0.0, 0.25, 0.0], threshold=0.3)

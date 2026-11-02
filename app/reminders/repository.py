@@ -32,7 +32,18 @@ def _row_to_reminder(row: sqlite3.Row) -> Reminder:
         status=ReminderStatus(row["status"]),
         created_at=datetime.fromisoformat(row["created_at"]),
         last_fired_at=datetime.fromisoformat(row["last_fired_at"]) if row["last_fired_at"] else None,
+        task_prompt=row["task_prompt"] if "task_prompt" in row.keys() else None,
     )
+
+
+def to_local_naive(value: datetime) -> datetime:
+    """Store every trigger time as naive local time. Times are compared as
+    ISO strings in SQL, so mixing "2026-01-01T09:00:00+05:30" with naive
+    local timestamps silently misorders them; normalising on the way in
+    keeps every comparison apples-to-apples."""
+    if value.tzinfo is not None:
+        return value.astimezone().replace(tzinfo=None)
+    return value
 
 
 class ReminderRepository:
@@ -49,6 +60,7 @@ class ReminderRepository:
         message: str,
         trigger_at: datetime,
         recurrence: RecurrenceType = RecurrenceType.NONE,
+        task_prompt: str | None = None,
     ) -> Reminder:
         if not message or not message.strip():
             raise ValueError("Reminder message cannot be empty.")
@@ -58,10 +70,16 @@ class ReminderRepository:
             now = datetime.now().isoformat()
             cursor = conn.execute(
                 """
-                INSERT INTO reminders (message, trigger_at, recurrence, status, created_at)
-                VALUES (?, ?, ?, 'pending', ?)
+                INSERT INTO reminders (message, trigger_at, recurrence, status, created_at, task_prompt)
+                VALUES (?, ?, ?, 'pending', ?, ?)
                 """,
-                (message.strip(), trigger_at.isoformat(), recurrence.value, now),
+                (
+                    message.strip(),
+                    to_local_naive(trigger_at).isoformat(),
+                    recurrence.value,
+                    now,
+                    task_prompt.strip() if task_prompt and task_prompt.strip() else None,
+                ),
             )
             conn.commit()
             row = conn.execute(
@@ -83,7 +101,7 @@ class ReminderRepository:
             conn.close()
 
     def get_due(self, as_of: datetime | None = None) -> list[Reminder]:
-        as_of = as_of or datetime.now()
+        as_of = to_local_naive(as_of) if as_of else datetime.now()
         conn = self._connect()
         try:
             rows = conn.execute(
